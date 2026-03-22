@@ -2,7 +2,7 @@
 
 This write-up documents a high-bandwidth covert command channel that uses **802.11 Vendor Specific Elements (Tag 221)** as a bidirectional C2 transport:
 
-> **Project Context:** This technique is a modular component of the next-generation **Audix C2 Framework**, currently under development and scheduled for release in **Q1 2026**.
+> **Project Context:** This technique is a modular component of the next-generation **Audix C2 Framework**, currently under development and scheduled for release in **Q2 2026**.
 > [Learn more about the Audix C2](https://www.security-auditing.com/C2)
 
 - **Server (Python / Kali, monitor mode):**  
